@@ -56,6 +56,15 @@ function New-Backup {
     return $manifest
 }
 
+function Get-LatestBackup {
+    $root = Get-BackupRoot
+    if (-not (Test-Path $root)) { return $null }
+    $manifests = Get-ChildItem -Path $root -Filter 'manifest.json' -Recurse -ErrorAction SilentlyContinue
+    if (-not $manifests) { return $null }
+    $latest = $manifests | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    return Get-Content $latest.FullName -Raw | ConvertFrom-Json
+}
+
 function Save-Backup {
     param($Backup)
     # snapshot already persisted during New-Backup; kept as a no-op seam

@@ -46,6 +46,7 @@ function Invoke-Tweak {
 }
 
 function Restore-FromBackup {
+    if (-not $script:Backup) { $script:Backup = Get-LatestBackup }
     if (-not $script:Backup) {
         Write-Log 'No backup to restore.' 'WARN'
         return
@@ -69,6 +70,8 @@ function New-Checkbox {
 }
 
 function Main {
+    $script:Backup = Get-LatestBackup
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Untitled Windows Optimization'
     $form.Size = New-Object System.Drawing.Size(760, 640)
@@ -170,7 +173,11 @@ function Main {
             return
         }
         Write-Log 'Creating System Restore point...' 'INFO'
-        Checkpoint-Computer -Description 'Untitled Windows Optimization' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction SilentlyContinue
+        try {
+            Checkpoint-Computer -Description 'Untitled Windows Optimization' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        } catch {
+            Write-Log 'System Restore point failed (System Restore may be disabled). Continuing with local backup.' 'WARN'
+        }
         $script:Backup = New-Backup
         foreach ($cb in $selected) { Invoke-Tweak $cb.Tag }
         Save-Backup $script:Backup

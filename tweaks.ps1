@@ -31,6 +31,7 @@ $script:RegistryTweaks = @(
         Id = 'remove-copilot'
         Name = 'Remove Copilot'
         Category = 'debloat'
+        os = 'win11'
         Presets = @('recommended', 'aggressive')
         Apply = {
             winget uninstall --id 9NHT9RB2F4HD --silent --accept-source-agreements
@@ -149,8 +150,13 @@ $script:RegistryTweaks = @(
     }
 )
 
+$script:OSBuild = [System.Environment]::OSVersion.Version.Build
+
 function Get-Tweaks {
     param([string]$Category)
-    if ($Category) { return @($script:RegistryTweaks | Where-Object { $_.Category -eq $Category }) }
-    return $script:RegistryTweaks
+    $tweaks = $script:RegistryTweaks
+    if ($Category) { $tweaks = @($tweaks | Where-Object { $_.Category -eq $Category }) }
+    return @($tweaks | Where-Object {
+        -not ($_.os -eq 'win11' -and $script:OSBuild -lt 22000)
+    })
 }
