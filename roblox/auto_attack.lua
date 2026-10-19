@@ -57,8 +57,6 @@ local IGNORE = {
 	Social = true,
 	Profanity = true,
 }
-local HEARTBEAT_REMOTES = IGNORE -- alias kept for readability below
--- names that smell like an attack; preferred over whatever else was seen
 local ATTACK_HINTS = { "Projectile", "Ability", "Sword", "Attack", "Hit", "Swing", "Combat", "Damage" }
 
 local function hintScore(name)
