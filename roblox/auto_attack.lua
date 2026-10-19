@@ -42,14 +42,22 @@ end
 --------------------------------------------------------------------
 
 local SELF_NAME = "MCBody" -- your own avatar; everything else prefixed MCBody is a target
-local HEARTBEAT_REMOTES = {
-	Lead = true, -- tick/lead pings, not attacks
+-- movement / telemetry / platform noise: never treat these as attacks
+local IGNORE = {
+	Lead = true,
 	NetDiag = true,
 	Metric = true,
 	PlayerList = true,
 	ClientReady = true,
 	LoadDiag = true,
+	MoveReport = true, -- the client's movement packet (fires constantly while walking)
+	Chunks = true,
+	Heartbeat = true,
+	Changelog = true,
+	Social = true,
+	Profanity = true,
 }
+local HEARTBEAT_REMOTES = IGNORE -- alias kept for readability below
 -- names that smell like an attack; preferred over whatever else was seen
 local ATTACK_HINTS = { "Projectile", "Ability", "Sword", "Attack", "Hit", "Swing", "Combat", "Damage" }
 
@@ -106,17 +114,37 @@ local lastAttack = nil -- { remote, method, args }
 local seen = {} -- remoteName -> { count = n, args = {...}, method = m, remote = inst }
 local enabled = false
 
+local function shortVal(v)
+	local t = typeof(v)
+	if t == "Instance" then
+		return (v.Name or "?")
+	elseif t == "string" then
+		return '"' .. v:sub(1, 24) .. '"'
+	elseif t == "number" or t == "boolean" then
+		return tostring(v)
+	elseif t == "table" then
+		return "table"
+	end
+	return tostring(v):sub(1, 32)
+end
+
 local function describeArgs(args)
 	local parts = {}
 	for i = 1, math.min(#args, 4) do
 		local v = args[i]
-		local t = typeof(v)
-		if t == "Instance" then
-			parts[#parts + 1] = (v.Name or "?")
-		elseif t == "table" then
-			parts[#parts + 1] = "table"
+		if typeof(v) == "table" then
+			local kv, n = {}, 0
+			for k, val in pairs(v) do
+				n = n + 1
+				if n > 6 then
+					kv[#kv + 1] = "..."
+					break
+				end
+				kv[#kv + 1] = tostring(k) .. "=" .. shortVal(val)
+			end
+			parts[#parts + 1] = "{" .. table.concat(kv, ",") .. "}"
 		else
-			parts[#parts + 1] = tostring(v):sub(1, 40)
+			parts[#parts + 1] = shortVal(v)
 		end
 	end
 	return "{" .. table.concat(parts, ", ") .. "}"
@@ -136,18 +164,38 @@ local function record(name, method, remote, a)
 	end
 end
 
+-- platform/stock folders whose traffic is never a game attack
+local PLATFORM_FOLDERS = {
+	RobloxReplicatedStorage = true,
+	RobloxServerStorage = true,
+	CorePackages = true,
+	Chat = true,
+	DefaultChatSystemChatEvents = true,
+	PlayerScripts = true,
+}
+
 local function isMcRemote(inst)
 	if typeof(inst) ~= "Instance" then
 		return false
 	end
-	local p = inst.Parent
-	if not p then
+	if IGNORE[inst.Name] then
 		return false
 	end
-	if p.Name == "MCRemotes" or (p.Parent and p.Parent.Name == "MCRemotes") then
-		return not HEARTBEAT_REMOTES[inst.Name]
+	-- walk up a few levels; skip anything inside the stock/platform folders
+	local node, depth = inst.Parent, 0
+	local underMc = false
+	while node and depth < 4 do
+		if PLATFORM_FOLDERS[node.Name] then
+			return false
+		end
+		if node.Name == "MCRemotes" then
+			underMc = true
+		end
+		node = node.Parent
+		depth = depth + 1
 	end
-	return false
+	-- a game remote under MCRemotes, or any remote whose name smells like an attack
+	return underMc or hintScore(inst.Name)
 end
 
 if hookmetamethod and getnamecallmethod then
