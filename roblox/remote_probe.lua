@@ -118,6 +118,13 @@ local function deepArgs(args)
 	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
+local function maybeDump(name, a)
+	if name == WATCH and tick() < captureUntil and dumped < DUMP_CAP then
+		dumped = dumped + 1
+		print(string.format("[probe] %s DUMP %s", name, deepArgs(a)))
+	end
+end
+
 --------------------------------------------------------------------
 -- Capture
 --------------------------------------------------------------------
@@ -139,27 +146,31 @@ end
 pcall(collect, ReplicatedStorage, 0)
 
 local hookedCount = 0
+local hookedSet = {}
 local function wrapMethod(remote, method)
 	local orig = remote[method]
 	if type(orig) ~= "function" then
 		return
 	end
+	local rname = remote.Name
 	local replacement = function(self, ...)
 		local a = { ... }
-		if name == WATCH and tick() < captureUntil and dumped < DUMP_CAP then
-			dumped = dumped + 1
-			print(string.format("[probe] %s DUMP %s", name, deepArgs(a)))
-		end
-		pcall(log, name, method, a)
+		maybeDump(rname, a)
+		pcall(log, rname, method, a)
 		return orig(self, ...)
 	end
 	local ok = pcall(hookfunction, orig, replacement)
 	if ok then
 		hookedCount = hookedCount + 1
+		hookedSet[remote] = true
 	end
 end
 
+local moveUnderRs = false
 for _, r in ipairs(remotes) do
+	if r.Name == WATCH then
+		moveUnderRs = true
+	end
 	pcall(wrapMethod, r, "FireServer")
 	if r:IsA("RemoteFunction") then
 		pcall(wrapMethod, r, "InvokeServer")
@@ -172,7 +183,11 @@ if hookmetamethod and getnamecallmethod then
 		old = hookmetamethod(game, "__namecall", function(self, ...)
 			local method = getnamecallmethod()
 			if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
-				pcall(log, self.Name, method, { ... })
+				local a = { ... }
+				if not hookedSet[self] then
+					maybeDump(self.Name, a)
+				end
+				pcall(log, self.Name, method, a)
 			end
 			return old(self, ...)
 		end)
@@ -185,6 +200,9 @@ end
 
 print(string.format("[probe] remotes found: %d (hooked %d) — hookfunction=%s namecall=%s",
 	#remotes, hookedCount, tostring(hookfunction ~= nil), tostring(hookmetamethod ~= nil)))
+if not moveUnderRs then
+	print("[probe] note: " .. WATCH .. " wasn't under ReplicatedStorage — hooked via namecall instead")
+end
 print("[probe] Left-click a player to attack; the full " .. WATCH .. " payload prints around each click. Press F for summary.")
 
 local UserInputService = game:GetService("UserInputService")
