@@ -48,6 +48,17 @@ local HEARTBEAT_REMOTES = {
 	ClientReady = true,
 	LoadDiag = true,
 }
+-- names that smell like an attack; preferred over whatever else was seen
+local ATTACK_HINTS = { "Projectile", "Ability", "Sword", "Attack", "Hit", "Swing", "Combat", "Block", "Damage" }
+
+local function hintScore(name)
+	for _, h in ipairs(ATTACK_HINTS) do
+		if name:find(h) then
+			return true
+		end
+	end
+	return false
+end
 
 local function isTargetBody(m)
 	if m.ClassName ~= "Model" then
@@ -90,7 +101,24 @@ end
 --------------------------------------------------------------------
 
 local lastAttack = nil -- { remote, method, args }
+local seen = {} -- remoteName -> { count = n, args = {...}, method = m, remote = inst }
 local enabled = false
+
+local function describeArgs(args)
+	local parts = {}
+	for i = 1, math.min(#args, 4) do
+		local v = args[i]
+		local t = typeof(v)
+		if t == "Instance" then
+			parts[#parts + 1] = (v.Name or "?")
+		elseif t == "table" then
+			parts[#parts + 1] = "table"
+		else
+			parts[#parts + 1] = tostring(v):sub(1, 40)
+		end
+	end
+	return "{" .. table.concat(parts, ", ") .. "}"
+end
 
 if hookmetamethod and getnamecallmethod then
 	local ok = pcall(function()
@@ -101,7 +129,19 @@ if hookmetamethod and getnamecallmethod then
 				local parent = self.Parent
 				local inMc = parent and (parent.Name == "MCRemotes" or (parent.Parent and parent.Parent.Name == "MCRemotes"))
 				if inMc and not HEARTBEAT_REMOTES[self.Name] then
-					lastAttack = { remote = self, method = method, args = { ... } }
+					local a = { ... }
+					local rec = seen[self.Name]
+					if rec then
+						rec.count = rec.count + 1
+						rec.args = a
+					else
+						seen[self.Name] = { count = 1, args = a, method = method, remote = self }
+					end
+					-- prefer hinted names; otherwise keep the freshest non-heartbeat packet
+					local hinted = hintScore(self.Name)
+					if hinted or not (lastAttack and hintScore(lastAttack.remote.Name)) then
+						lastAttack = { remote = self, method = method, args = a }
+					end
 				end
 			end
 			return oldNamecall(self, ...)
@@ -200,9 +240,12 @@ task.spawn(function()
 			end
 			if target and target.Parent and lastAttack and lastAttack.remote and lastAttack.remote.Parent then
 				task.spawn(function()
-					pcall(function()
+					local ok, err = pcall(function()
 						lastAttack.remote[lastAttack.method](lastAttack.remote, table.unpack(lastAttack.args))
 					end)
+					if not ok then
+						warn_("[AutoAttack] attack fire failed: " .. tostring(err))
+					end
 				end)
 			end
 		end
@@ -223,7 +266,18 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if not enabled then
 			hideBox()
 		end
-		print("[AutoAttack] " .. (enabled and "ON" or "OFF") .. (enabled and (lastAttack and " (packet learned)" or " — swing once to learn the attack packet") or ""))
+		local summary = {}
+		for name, rec in pairs(seen) do
+			summary[#summary + 1] = name .. " x" .. rec.count
+		end
+		table.sort(summary)
+		print("[AutoAttack] " .. (enabled and "ON" or "OFF"))
+		print("[AutoAttack] seen remotes: " .. (#summary > 0 and table.concat(summary, ", ") or "none"))
+		if lastAttack then
+			print("[AutoAttack] attacking with: " .. lastAttack.remote.Name .. "." .. lastAttack.method .. " " .. describeArgs(lastAttack.args))
+		else
+			print("[AutoAttack] no packet learned — swing/place/use an item first")
+		end
 	end
 end)
 
