@@ -27,6 +27,8 @@ local makefolder = need("makefolder")
 local appendfile = need("appendfile")
 local hookmetamethod = need("hookmetamethod")
 local getnamecallmethod = need("getnamecallmethod")
+local getrawmetatable = need("getrawmetatable")
+local setreadonly = need("setreadonly")
 local gethui = need("gethui")
 local identifyexecutor = need("identifyexecutor")
 -- optional, never abort on these:
@@ -160,7 +162,7 @@ if hookmetamethod and getnamecallmethod then
 		local oldNamecall
 		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
 			local method = getnamecallmethod()
-			if sessionActive and (method == "FireServer" or method == "InvokeServer" or method == "invokeServer") then
+			if sessionActive and (method == "FireServer" or method == "InvokeServer") then
 				pcall(logRemote, method, self, args)
 			end
 			return oldNamecall(self, ...)
@@ -168,6 +170,34 @@ if hookmetamethod and getnamecallmethod then
 	end)
 	if ok then
 		spyMode = "hook"
+	end
+end
+
+-- Sigma-Spy-style fallback: raw __index hook catches dot-call style (remote.FireServer(remote, ...)),
+-- which __namecall never sees. Kept always-on alongside the namecall hook (guarded, only these two keys).
+local INDEX_METHODS = { FireServer = true, InvokeServer = true }
+local rawMtRef, rawOldIndex -- hoisted so Stop can restore the metatable
+if getrawmetatable and setreadonly then
+	local okIndex = pcall(function()
+		local mt = getrawmetatable(game)
+		rawMtRef = mt
+		rawOldIndex = mt.__index
+		setreadonly(mt, false)
+		mt.__index = function(s, k)
+			local orig = rawOldIndex(s, k) -- resolve first, outside the guard, keeps stats reads cheap
+			if sessionActive and INDEX_METHODS[k] and type(orig) == "function" then
+				return function(self, ...)
+					pcall(logRemote, k .. "(idx)", self, args)
+					return orig(self, ...)
+				end
+			end
+			return orig
+		end -- ponytail: readonly restored only on session stop; cheap on one metatable
+	end)
+	if okIndex and spyMode == "hook" then
+		spyMode = "hook+index"
+	elseif okIndex then
+		spyMode = "index"
 	end
 end
 
@@ -388,103 +418,31 @@ task.spawn(function()
 	end
 end)
 
---------------------------------------------------------------------
--- SECTION 6: Panel UI (basic ScreenGui)
---------------------------------------------------------------------
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "GameDumpsAnalyzer"
-gui.ResetOnSpawn = false
-local okGui = pcall(function()
-	local parent = (gethui and gethui()) or game:GetService("CoreGui")
-	gui.Parent = parent
-end)
-if not okGui then
-	gui.Parent = player.PlayerGui
-end
-
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(230, 130)
-frame.Position = UDim2.fromOffset(8, 8)
-frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
-frame.BorderSizePixel = 0
-frame.Active = true
-frame.Draggable = true
-frame.Parent = gui
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -10, 0, 22)
-title.Position = UDim2.fromOffset(5, 4)
-title.BackgroundTransparency = 1
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.Text = "Dumper — " .. GAME_NAME:sub(1, 24)
-title.TextSize = 14
-title.Parent = frame
-
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -10, 0, 36)
-status.Position = UDim2.fromOffset(5, 26)
-status.BackgroundTransparency = 1
-status.TextColor3 = Color3.fromRGB(150, 255, 150)
-status.TextSize = 12
-status.TextYAlignment = Enum.TextYAlignment.Top
-status.Text = "Recording...\nspy: " .. spyMode .. "  dir: " .. tostring(HAVE_DIR)
-status.Parent = frame
-
-local function makeButton(text, x, callback)
-	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(68, 24)
-	b.Position = UDim2.fromOffset(x, 78)
-	b.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
-	b.TextColor3 = Color3.fromRGB(255, 255, 255)
-	b.TextSize = 12
-	b.Text = text
-	b.Parent = frame
-	b.MouseButton1Click:Connect(callback)
-	return b
-end
-
-local function updateStatus()
-	status.Text = ("Recording... %ds\nspy: %s | out %d%s | in %d | writes %d\ninstr %d, dropped %d"):format(
-		tick() - sessionStart,
-		spyMode,
-		#remotes - s2c,
-		remotesDropped > 0 and "*" or "",
-		s2c,
-		wroteSinceRejoin,
-		instrumented,
-		remotesDropped
-	)
-end
-
-makeButton("Export", 8, function()
-	writeFileSafe("remotes.json", jsonEncode({ meta = buildMeta(false), events = remotes }) or "{}")
-	writeFileSafe("playerstate.json", jsonEncode({ meta = buildMeta(false), samples = states }) or "{}")
-	writeFileSafe("hierarchy.json", jsonEncode({ meta = buildMeta(false), roots = buildHierarchy() }) or "{}")
+-- Console controls (replaces removed GUI): call from executor console.
+env.GameDumpsExport = function()
+	writeFileSafe("remotes.json", jsonEncode({ meta = buildMeta(nil), events = remotes }) or "{}")
+	writeFileSafe("playerstate.json", jsonEncode({ meta = buildMeta(nil), samples = states }) or "{}")
+	writeFileSafe("hierarchy.json", jsonEncode({ meta = buildMeta(nil), roots = buildHierarchy() }) or "{}")
 	appendLog("manual export")
-	status.Text = "Exported to:\n" .. filePath("remotes.json"):sub(1, 60)
-end)
-
-makeButton("Stop", 82, function()
+	print("[GameDumps] Exported to " .. filePath("remotes.json"))
+end
+env.GameDumpsStop = function()
 	sessionActive = false
-	warn("[GameDumps] Stopped recording (manual export for a final flush)")
-	status.Text = "Stopped. Manual Export flushes everything."
-end)
-
-makeButton("Clear", 156, function()
-	remotes = {}
-	states = {}
-	status.Text = "Buffered data cleared."
-end)
-
-task.spawn(function()
-	while sessionActive do
-		task.wait(1)
-		updateStatus()
+	if rawMtRef and rawOldIndex and setreadonly then
+		pcall(function()
+			rawMtRef.__index = rawOldIndex
+			setreadonly(rawMtRef, true)
+		end)
 	end
-end)
+	print("[GameDumps] Stopped. Now run env.GameDumpsExport() for a final flush.")
+end
+env.GameDumpsStatus = function()
+	print(("[GameDumps] up %ds | spy %s | out %d | in %d | instr %d | writes %d | dropped %d"):format(
+		tick() - sessionStart, spyMode, #remotes - s2c, s2c, instrumented, wroteSinceRejoin, remotesDropped))
+end
 
 print("[GameDumps] Running. Output: game dumps/" .. GAME_NAME .. " (dir=" .. tostring(HAVE_DIR) .. ", spy=" .. spyMode .. ")")
+print("[GameDumps] Controls were removed with the GUI. Functions available: env.GameDumpsExport() / env.GameDumpsStop() / env.GameDumpsStatus()")
 
 --------------------------------------------------------------------
 -- SELF CHECK (runnable check: env adequacy + JSON round-trip)
