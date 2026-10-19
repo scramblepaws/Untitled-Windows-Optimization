@@ -71,17 +71,15 @@ local function log(name, method, args)
 end
 
 --------------------------------------------------------------------
--- Deep dump of a specific remote's payload, around a mouse click.
--- Attacks appear to ride the input stream (MoveReport), so we print the
--- FULL structure for a short window after every left click.
+-- Deep dump of MoveReport (the input stream) to find the attack variant.
 --------------------------------------------------------------------
 
 local WATCH = "MoveReport"
-local CLICK_WINDOW = 2.5 -- seconds after each click
 local DUMP_CAP = 60
 
-local captureUntil = 0
 local dumped = 0
+local lastSig = nil
+local ALWAYS_FIRST = 15 -- always dump the first N, then only when the packet shape changes
 
 local function deep(v, depth)
 	depth = depth or 0
@@ -118,10 +116,34 @@ local function deepArgs(args)
 	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
+-- MoveReport batches input: { e=<code>, t=<tick>, f=<flags>, n=<inputs> }.
+-- Dump the first few, then only when the shape (e/f + keys of n) changes — that
+-- catches the "attack" variant without spamming every mouse-look frame.
+local function sigOf(a)
+	local p = a[1]
+	if typeof(p) ~= "table" then
+		return tostring(p)
+	end
+	local keys = {}
+	if typeof(p.n) == "table" then
+		for k in pairs(p.n) do
+			keys[#keys + 1] = tostring(k)
+		end
+	end
+	table.sort(keys)
+	return tostring(p.e) .. "|" .. tostring(p.f) .. "|" .. table.concat(keys, ",")
+end
+
 local function maybeDump(name, a)
-	if name == WATCH and tick() < captureUntil and dumped < DUMP_CAP then
+	if name ~= WATCH then
+		return
+	end
+	local sig = sigOf(a)
+	local changed = sig ~= lastSig
+	lastSig = sig
+	if (dumped < ALWAYS_FIRST or changed) and dumped < DUMP_CAP then
 		dumped = dumped + 1
-		print(string.format("[probe] %s DUMP %s", name, deepArgs(a)))
+		print(string.format("[probe] %s#%d %s", name, dumped, deepArgs(a)))
 	end
 end
 
@@ -203,18 +225,19 @@ print(string.format("[probe] remotes found: %d (hooked %d) — hookfunction=%s n
 if not moveUnderRs then
 	print("[probe] note: " .. WATCH .. " wasn't under ReplicatedStorage — hooked via namecall instead")
 end
-print("[probe] Left-click a player to attack; the full " .. WATCH .. " payload prints around each click. Press F for summary.")
+print("[probe] Now fight: attack a player. Distinct " .. WATCH .. " shapes print as %s#N. Press F for summary.")
 
 local UserInputService = game:GetService("UserInputService")
+local inputLogs = 0
 UserInputService.InputBegan:Connect(function(input, processed)
+	if inputLogs < 40 then
+		inputLogs = inputLogs + 1
+		print(string.format("[probe] input %s processed=%s", input.UserInputType.Name, tostring(processed)))
+	end
 	if processed then
 		return
 	end
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		captureUntil = tick() + CLICK_WINDOW
-		dumped = 0
-		print("[probe] CLICK -> dumping " .. WATCH .. " for " .. CLICK_WINDOW .. "s")
-	elseif input.KeyCode == Enum.KeyCode.F then
+	if input.KeyCode == Enum.KeyCode.F then
 		local rows = {}
 		for name, c in pairs(counts) do
 			rows[#rows + 1] = name .. " x" .. c
