@@ -78,8 +78,7 @@ local WATCH = "MoveReport"
 local DUMP_CAP = 60
 
 local dumped = 0
-local lastSig = nil
-local ALWAYS_FIRST = 15 -- always dump the first N, then only when the packet shape changes
+local ALWAYS_FIRST = 15 -- always dump the first N, then only when the shape/code changes
 
 local function deep(v, depth)
 	depth = depth or 0
@@ -117,34 +116,55 @@ local function deepArgs(args)
 end
 
 -- MoveReport batches input: { e=<code>, t=<tick>, f=<flags>, n=<inputs> }.
--- Dump the first few, then only when the shape (e/f + keys of n) changes — that
--- catches the "attack" variant without spamming every mouse-look frame.
-local function sigOf(a)
+-- We dump when the STRUCTURE changes (new keys, i.e. a new kind of input) or when
+-- an unseen `e` code appears, throttled to 3/s so the log spans the whole fight
+-- even if some fields increment every frame.
+local seenE = {}
+local lastShape = nil
+local lastDump = 0
+local THROTTLE = 0.35
+
+local function shapeOf(a)
 	local p = a[1]
 	if typeof(p) ~= "table" then
 		return tostring(p)
 	end
 	local keys = {}
+	for k in pairs(p) do
+		keys[#keys + 1] = tostring(k)
+	end
 	if typeof(p.n) == "table" then
 		for k in pairs(p.n) do
-			keys[#keys + 1] = tostring(k)
+			keys[#keys + 1] = "n." .. tostring(k)
 		end
 	end
 	table.sort(keys)
-	return tostring(p.e) .. "|" .. tostring(p.f) .. "|" .. table.concat(keys, ",")
+	return table.concat(keys, ",")
 end
 
 local function maybeDump(name, a)
-	if name ~= WATCH then
+	if name ~= WATCH or dumped >= DUMP_CAP then
 		return
 	end
-	local sig = sigOf(a)
-	local changed = sig ~= lastSig
-	lastSig = sig
-	if (dumped < ALWAYS_FIRST or changed) and dumped < DUMP_CAP then
-		dumped = dumped + 1
-		print(string.format("[probe] %s#%d %s", name, dumped, deepArgs(a)))
+	local p = a[1]
+	local e = typeof(p) == "table" and p.e or nil
+	local shape = shapeOf(a)
+	local newShape = shape ~= lastShape
+	local newE = e ~= nil and not seenE[e]
+	if e ~= nil then
+		seenE[e] = true
 	end
+	lastShape = shape
+	if not (dumped < ALWAYS_FIRST or newShape or newE) then
+		return
+	end
+	local now = tick()
+	if dumped >= ALWAYS_FIRST and now - lastDump < THROTTLE then
+		return
+	end
+	lastDump = now
+	dumped = dumped + 1
+	print(string.format("[probe] %s#%d e=%s %s", name, dumped, tostring(e), deepArgs(a)))
 end
 
 --------------------------------------------------------------------
