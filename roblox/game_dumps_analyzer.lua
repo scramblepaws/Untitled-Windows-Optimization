@@ -2,6 +2,7 @@
 -- Run once per session. Records remote traffic, hierarchy, and player state continuously,
 -- writes JSON dumps + append log into <executor workspace>/game dumps/<GameName>/.
 -- ponytail: fixed caps (500 remote events, 200 state samples, depth/desc caps) — raise if stars align.
+-- Records BOTH directions: client->server via __namecall hook, server->client via OnClientEvent listeners.
 
 --------------------------------------------------------------------
 -- SECTION 0: Compat layer (UNC/SUNC API surface)
@@ -82,6 +83,7 @@ end
 local remotes = {} -- ring buffer
 local REMOTE_CAP = 500
 local remotesDropped = 0
+local s2c = 0 -- server->client event count
 
 local function instancePath(inst)
 	local ok, path = pcall(function()
@@ -195,6 +197,31 @@ if spyMode ~= "hook" then
 	spyMode = getconnections and "connections" or "none"
 end
 
+-- Server->client recording: plain OnClientEvent listeners (always on, hook or not).
+-- Rescans every 30s to catch remotes created after startup. Cap 100 instrumented remotes.
+local instrumented = 0
+local instrumentedSet = {} -- instance -> true
+task.spawn(function()
+	while sessionActive do
+		pcall(function()
+			for _, desc in ipairs(game:GetDescendants()) do
+				if instrumented >= 100 then
+					break
+				end
+				if (desc:IsA("RemoteEvent")) and not instrumentedSet[desc] then
+					instrumentedSet[desc] = true
+					instrumented = instrumented + 1
+					desc.OnClientEvent:Connect(function(...)
+						s2c = s2c + 1
+						logRemote("OnClientEvent", desc, { ... })
+					end)
+				end
+			end
+		end)
+		task.wait(30)
+	end
+end)
+
 --------------------------------------------------------------------
 -- SECTION 3: Hierarchy dump (lazy, built on Export)
 --------------------------------------------------------------------
@@ -254,6 +281,7 @@ local STATE_CAP = 200
 
 local function snapshotPlayer()
 	local s = { t = os.time() }
+	s.hasChar = player.Character ~= nil
 	local ls = player:FindFirstChild("leaderstats")
 	if ls then
 		local stats = {}
@@ -417,12 +445,14 @@ local function makeButton(text, x, callback)
 end
 
 local function updateStatus()
-	status.Text = ("Recording... %ds\nspy: %s | remotes %d%s | writes %d\nbuffer full, dropped %d"):format(
+	status.Text = ("Recording... %ds\nspy: %s | out %d%s | in %d | writes %d\ninstr %d, dropped %d"):format(
 		tick() - sessionStart,
 		spyMode,
-		#remotes,
+		#remotes - s2c,
 		remotesDropped > 0 and "*" or "",
+		s2c,
 		wroteSinceRejoin,
+		instrumented,
 		remotesDropped
 	)
 end
