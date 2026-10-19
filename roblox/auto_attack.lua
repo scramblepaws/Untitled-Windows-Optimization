@@ -23,6 +23,8 @@ local CONFIG = {
 local warn_ = warn
 local hookmetamethod = hookmetamethod or _G.hookmetamethod
 local getnamecallmethod = getnamecallmethod or _G.getnamecallmethod
+local getrawmetatable = getrawmetatable or _G.getrawmetatable
+local setreadonly = setreadonly or _G.setreadonly
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -49,7 +51,7 @@ local HEARTBEAT_REMOTES = {
 	LoadDiag = true,
 }
 -- names that smell like an attack; preferred over whatever else was seen
-local ATTACK_HINTS = { "Projectile", "Ability", "Sword", "Attack", "Hit", "Swing", "Combat", "Block", "Damage" }
+local ATTACK_HINTS = { "Projectile", "Ability", "Sword", "Attack", "Hit", "Swing", "Combat", "Damage" }
 
 local function hintScore(name)
 	for _, h in ipairs(ATTACK_HINTS) do
@@ -120,38 +122,107 @@ local function describeArgs(args)
 	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
+local function record(name, method, remote, a)
+	local rec = seen[name]
+	if rec then
+		rec.count = rec.count + 1
+		rec.args = a
+	else
+		seen[name] = { count = 1, args = a, method = method, remote = remote }
+	end
+	-- prefer hinted names; otherwise keep the freshest non-heartbeat packet
+	if hintScore(name) or not (lastAttack and hintScore(lastAttack.remote.Name)) then
+		lastAttack = { remote = remote, method = method, args = a }
+	end
+end
+
+local function isMcRemote(inst)
+	if typeof(inst) ~= "Instance" then
+		return false
+	end
+	local p = inst.Parent
+	if not p then
+		return false
+	end
+	if p.Name == "MCRemotes" or (p.Parent and p.Parent.Name == "MCRemotes") then
+		return not HEARTBEAT_REMOTES[inst.Name]
+	end
+	return false
+end
+
 if hookmetamethod and getnamecallmethod then
 	local ok = pcall(function()
 		local oldNamecall
 		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
 			local method = getnamecallmethod()
-			if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
-				local parent = self.Parent
-				local inMc = parent and (parent.Name == "MCRemotes" or (parent.Parent and parent.Parent.Name == "MCRemotes"))
-				if inMc and not HEARTBEAT_REMOTES[self.Name] then
-					local a = { ... }
-					local rec = seen[self.Name]
-					if rec then
-						rec.count = rec.count + 1
-						rec.args = a
-					else
-						seen[self.Name] = { count = 1, args = a, method = method, remote = self }
-					end
-					-- prefer hinted names; otherwise keep the freshest non-heartbeat packet
-					local hinted = hintScore(self.Name)
-					if hinted or not (lastAttack and hintScore(lastAttack.remote.Name)) then
-						lastAttack = { remote = self, method = method, args = a }
-					end
-				end
+			if (method == "FireServer" or method == "InvokeServer") and isMcRemote(self) then
+				pcall(record, self.Name, method, self, { ... })
 			end
 			return oldNamecall(self, ...)
 		end)
 	end)
 	if not ok then
-		warn_("[AutoAttack] Could not hook __namecall — attack replay disabled, ESP still works.")
+		warn_("[AutoAttack] Could not hook __namecall — trying __index only.")
 	end
-else
-	warn_("[AutoAttack] Executor lacks hookmetamethod/getnamecallmethod — attack replay disabled, ESP still works.")
+end
+
+-- sigma-spy-style: also catch dot-calls (remote.FireServer(remote, ...)) and cached method refs
+local INDEX_METHODS = { FireServer = true, InvokeServer = true }
+local rawMtRef, rawOldIndex
+if getrawmetatable and setreadonly then
+	pcall(function()
+		local mt = getrawmetatable(game)
+		rawMtRef, rawOldIndex = mt, mt.__index
+		setreadonly(mt, false)
+		mt.__index = function(s, k)
+			local orig = rawOldIndex(s, k)
+			if INDEX_METHODS[k] and type(orig) == "function" and isMcRemote(s) then
+				return function(self, ...)
+					pcall(record, self.Name, k, self, { ... })
+					return orig(self, ...)
+				end
+			end
+			return orig
+		end
+	end)
+end
+
+--------------------------------------------------------------------
+-- Retargeting: replayed packets carry the position/target you used when
+-- swinging; swap them for the current target so the hit lands on the box.
+--------------------------------------------------------------------
+
+local function isBodyModel(v)
+	return typeof(v) == "Instance" and v:IsA("Model") and v.Name:sub(1, 6) == "MCBody"
+end
+
+local function retargetValue(v, target, targetPos, depth)
+	local t = typeof(v)
+	if t == "Instance" then
+		if isBodyModel(v) and v ~= target then
+			return target
+		end
+		return v
+	elseif t == "Vector3" then
+		return targetPos
+	elseif t == "CFrame" then
+		return CFrame.new(targetPos) * (v - v.Position)
+	elseif t == "table" and (depth or 0) < 1 then
+		local out = {}
+		for k, val in pairs(v) do
+			out[k] = retargetValue(val, target, targetPos, (depth or 0) + 1)
+		end
+		return out
+	end
+	return v
+end
+
+local function retarget(args, target, targetPos)
+	local out = {}
+	for i = 1, #args do
+		out[i] = retargetValue(args[i], target, targetPos, 0)
+	end
+	return out
 end
 
 --------------------------------------------------------------------
@@ -231,25 +302,33 @@ RunService.RenderStepped:Connect(function()
 	end
 end)
 
+local fireCount = 0
 task.spawn(function()
 	while true do
 		task.wait(CONFIG.ATTACK_INTERVAL)
 		if enabled then
 			if not target or not target.Parent then
-				target = select(1, findNearest())
+				target = findNearest()
 			end
 			if target and target.Parent and lastAttack and lastAttack.remote and lastAttack.remote.Parent then
+				local t = target
+				local head = headOf(t)
+				local tPos = head and head.Position or camera.CFrame.Position
+				local remote, method = lastAttack.remote, lastAttack.method
+				local args = retarget(lastAttack.args, t, tPos)
 				task.spawn(function()
 					local ok, err = pcall(function()
-						lastAttack.remote[lastAttack.method](lastAttack.remote, table.unpack(lastAttack.args))
+						remote[method](remote, table.unpack(args))
 					end)
+					fireCount = fireCount + 1
 					if not ok then
 						warn_("[AutoAttack] attack fire failed: " .. tostring(err))
+					elseif fireCount % 5 == 1 then
+						print("[AutoAttack] fired " .. remote.Name .. "." .. method .. " " .. describeArgs(args) .. " at " .. t.Name)
 					end
 				end)
 			end
 		end
-		-- re-learn: if user manually attacks while enabled, keep the freshest packet
 	end
 end)
 
@@ -271,7 +350,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 			summary[#summary + 1] = name .. " x" .. rec.count
 		end
 		table.sort(summary)
-		print("[AutoAttack] " .. (enabled and "ON" or "OFF"))
+		print("[AutoAttack] " .. (enabled and "ON" or "OFF") .. "  (fired " .. fireCount .. " times)")
 		print("[AutoAttack] seen remotes: " .. (#summary > 0 and table.concat(summary, ", ") or "none"))
 		if lastAttack then
 			print("[AutoAttack] attacking with: " .. lastAttack.remote.Name .. "." .. lastAttack.method .. " " .. describeArgs(lastAttack.args))
