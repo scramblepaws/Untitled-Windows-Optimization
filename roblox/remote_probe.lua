@@ -71,6 +71,54 @@ local function log(name, method, args)
 end
 
 --------------------------------------------------------------------
+-- Deep dump of a specific remote's payload, around a mouse click.
+-- Attacks appear to ride the input stream (MoveReport), so we print the
+-- FULL structure for a short window after every left click.
+--------------------------------------------------------------------
+
+local WATCH = "MoveReport"
+local CLICK_WINDOW = 2.5 -- seconds after each click
+local DUMP_CAP = 60
+
+local captureUntil = 0
+local dumped = 0
+
+local function deep(v, depth)
+	depth = depth or 0
+	local t = typeof(v)
+	if t == "table" then
+		if depth >= 3 then
+			return "{..}"
+		end
+		local parts, n = {}, 0
+		for k, val in pairs(v) do
+			n = n + 1
+			if n > 14 then
+				parts[#parts + 1] = ".."
+				break
+			end
+			parts[#parts + 1] = tostring(k) .. "=" .. deep(val, depth + 1)
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	elseif t == "Instance" then
+		return v.Name
+	elseif t == "Vector3" or t == "CFrame" then
+		return tostring(v):sub(1, 48)
+	elseif t == "string" then
+		return '"' .. v:sub(1, 40) .. '"'
+	end
+	return tostring(v):sub(1, 40)
+end
+
+local function deepArgs(args)
+	local parts = {}
+	for i = 1, math.min(#args, 6) do
+		parts[#parts + 1] = deep(args[i], 0)
+	end
+	return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+--------------------------------------------------------------------
 -- Capture
 --------------------------------------------------------------------
 
@@ -97,7 +145,12 @@ local function wrapMethod(remote, method)
 		return
 	end
 	local replacement = function(self, ...)
-		pcall(log, remote.Name, method, { ... })
+		local a = { ... }
+		if name == WATCH and tick() < captureUntil and dumped < DUMP_CAP then
+			dumped = dumped + 1
+			print(string.format("[probe] %s DUMP %s", name, deepArgs(a)))
+		end
+		pcall(log, name, method, a)
 		return orig(self, ...)
 	end
 	local ok = pcall(hookfunction, orig, replacement)
@@ -132,13 +185,18 @@ end
 
 print(string.format("[probe] remotes found: %d (hooked %d) — hookfunction=%s namecall=%s",
 	#remotes, hookedCount, tostring(hookfunction ~= nil), tostring(hookmetamethod ~= nil)))
-print("[probe] Now attack someone. Paste every [probe] line. Press F to dump the running summary.")
+print("[probe] Left-click a player to attack; the full " .. WATCH .. " payload prints around each click. Press F for summary.")
 
-game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
+local UserInputService = game:GetService("UserInputService")
+UserInputService.InputBegan:Connect(function(input, processed)
 	if processed then
 		return
 	end
-	if input.KeyCode == Enum.KeyCode.F then
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		captureUntil = tick() + CLICK_WINDOW
+		dumped = 0
+		print("[probe] CLICK -> dumping " .. WATCH .. " for " .. CLICK_WINDOW .. "s")
+	elseif input.KeyCode == Enum.KeyCode.F then
 		local rows = {}
 		for name, c in pairs(counts) do
 			rows[#rows + 1] = name .. " x" .. c
