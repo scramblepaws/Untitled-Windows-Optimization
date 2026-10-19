@@ -75,22 +75,24 @@ end
 --------------------------------------------------------------------
 
 local WATCH = "MoveReport"
-local DUMP_CAP = 60
+local DUMP_CAP = 120
 
 local dumped = 0
-local ALWAYS_FIRST = 15 -- always dump the first N, then only when the shape/code changes
+local ALWAYS_FIRST = 12 -- always dump the first N, then only inside a click window
+local clickUntil = 0 -- dump every WATCH call while tick() < this
+local CLICK_WINDOW = 0.7
 
 local function deep(v, depth)
 	depth = depth or 0
 	local t = typeof(v)
 	if t == "table" then
-		if depth >= 3 then
+		if depth >= 4 then
 			return "{..}"
 		end
 		local parts, n = {}, 0
 		for k, val in pairs(v) do
 			n = n + 1
-			if n > 14 then
+			if n > 16 then
 				parts[#parts + 1] = ".."
 				break
 			end
@@ -116,55 +118,18 @@ local function deepArgs(args)
 end
 
 -- MoveReport batches input: { e=<code>, t=<tick>, f=<flags>, n=<inputs> }.
--- We dump when the STRUCTURE changes (new keys, i.e. a new kind of input) or when
--- an unseen `e` code appears, throttled to 3/s so the log spans the whole fight
--- even if some fields increment every frame.
-local seenE = {}
-local lastShape = nil
-local lastDump = 0
-local THROTTLE = 0.35
-
-local function shapeOf(a)
-	local p = a[1]
-	if typeof(p) ~= "table" then
-		return tostring(p)
-	end
-	local keys = {}
-	for k in pairs(p) do
-		keys[#keys + 1] = tostring(k)
-	end
-	if typeof(p.n) == "table" then
-		for k in pairs(p.n) do
-			keys[#keys + 1] = "n." .. tostring(k)
-		end
-	end
-	table.sort(keys)
-	return table.concat(keys, ",")
-end
-
+-- Always dump the first few to learn the shape, then every call within a click
+-- window (so we can see exactly what an attack adds).
 local function maybeDump(name, a)
 	if name ~= WATCH or dumped >= DUMP_CAP then
 		return
 	end
-	local p = a[1]
-	local e = typeof(p) == "table" and p.e or nil
-	local shape = shapeOf(a)
-	local newShape = shape ~= lastShape
-	local newE = e ~= nil and not seenE[e]
-	if e ~= nil then
-		seenE[e] = true
-	end
-	lastShape = shape
-	if not (dumped < ALWAYS_FIRST or newShape or newE) then
+	local inWindow = tick() < clickUntil
+	if not inWindow and dumped >= ALWAYS_FIRST then
 		return
 	end
-	local now = tick()
-	if dumped >= ALWAYS_FIRST and now - lastDump < THROTTLE then
-		return
-	end
-	lastDump = now
 	dumped = dumped + 1
-	print(string.format("[probe] %s#%d e=%s %s", name, dumped, tostring(e), deepArgs(a)))
+	print(string.format("[probe] %s#%d %s", name, dumped, deepArgs(a)))
 end
 
 --------------------------------------------------------------------
@@ -188,7 +153,6 @@ end
 pcall(collect, ReplicatedStorage, 0)
 
 local hookedCount = 0
-local hookedSet = {}
 local function wrapMethod(remote, method)
 	local orig = remote[method]
 	if type(orig) ~= "function" then
@@ -204,7 +168,6 @@ local function wrapMethod(remote, method)
 	local ok = pcall(hookfunction, orig, replacement)
 	if ok then
 		hookedCount = hookedCount + 1
-		hookedSet[remote] = true
 	end
 end
 
@@ -226,9 +189,7 @@ if hookmetamethod and getnamecallmethod then
 			local method = getnamecallmethod()
 			if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
 				local a = { ... }
-				if not hookedSet[self] then
-					maybeDump(self.Name, a)
-				end
+				maybeDump(self.Name, a)
 				pcall(log, self.Name, method, a)
 			end
 			return old(self, ...)
@@ -245,12 +206,17 @@ print(string.format("[probe] remotes found: %d (hooked %d) — hookfunction=%s n
 if not moveUnderRs then
 	print("[probe] note: " .. WATCH .. " wasn't under ReplicatedStorage — hooked via namecall instead")
 end
-print("[probe] Now fight: attack a player. Distinct " .. WATCH .. " shapes print as %s#N. Press F for summary.")
+print(string.format("[probe] Now fight: attack a player. Distinct %s shapes print as #N. Press F for summary.", WATCH))
 
 local UserInputService = game:GetService("UserInputService")
 local inputLogs = 0
 UserInputService.InputBegan:Connect(function(input, processed)
-	if inputLogs < 40 then
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		clickUntil = tick() + CLICK_WINDOW
+		dumped = 0
+		print("[probe] CLICK -> dumping " .. WATCH .. " for " .. CLICK_WINDOW .. "s")
+	end
+	if inputLogs < 20 then
 		inputLogs = inputLogs + 1
 		print(string.format("[probe] input %s processed=%s", input.UserInputType.Name, tostring(processed)))
 	end
